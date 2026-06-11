@@ -274,7 +274,30 @@ def kernel(
     raise ValueError(
         "mesh cannot be a sequence when body is a single callable."
     )
-  return make_kernel([(mesh, body)])
+  # For a single mesh, lower through core_map directly rather than mpmd_map,
+  # which has higher per-kernel overhead in the single-mesh case.
+  def _get_empty_ref(out):
+    aval = pl_core._convert_out_shape_to_aval(out)
+    mem_space = (None if isinstance(aval.memory_space, jax_core.MemorySpace)
+                 else aval.memory_space)
+    val = lax.empty(aval.shape, aval.dtype, out_sharding=aval.sharding)
+    return jax_core.new_ref(val, memory_space=mem_space)
+  _unwrap_out = not isinstance(out_type, (tuple, list))
+  _out_specs = (out_type,) if _unwrap_out else out_type
+  @api.jit
+  def _coremap_kernel(*operands):
+    arg_refs = tree_util.tree_map(jax_core.new_ref, operands)
+    out_refs = tree_util.tree_map(_get_empty_ref, _out_specs)
+    @pl_core.core_map(
+        mesh, scratch_shapes=scratch_types, compiler_params=compiler_params,
+        interpret=interpret, debug=debug, cost_estimate=cost_estimate,
+        name=name, metadata=metadata,
+    )
+    def _(*scratch_refs, **scratch_kwrefs):
+      return body(*arg_refs, *out_refs, *scratch_refs, **scratch_kwrefs)
+    outs = tree_util.tree_map(lambda ref: ref[...], out_refs)
+    return outs[0] if _unwrap_out else outs
+  return _coremap_kernel
 
 
 def with_scoped(
